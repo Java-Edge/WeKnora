@@ -1,0 +1,32 @@
+# 本文件为本地部署覆盖配置（不入 git，docker compose 自动合并）。
+# 用途：
+#   1. postgres 命令: 强制监听所有网卡。paradedb/paradedb:v0.25.11-pg17 入口脚本最终
+#      `exec postgres` 不带 -c listen_addresses，镜像 postgresql.conf 也未设置，默认只监听
+#      localhost，app 容器跨容器连接 5432 会被拒（connection refused）。
+#      同时预加载 pg_search: ParadeDB v0.25.x 的 pg_search 扩展必须通过
+#      shared_preload_libraries 加载，否则 CREATE EXTENSION pg_search 报错。
+#      （本机曾因宿主机磁盘写满导致镜像层内 pg_search.so 损坏、加载时 SIGBUS 打崩后端，
+#       重新 pull 镜像解决；如再遇 SIGBUS，先 docker pull 重拉该镜像验证。）
+#   2. postgres 健康检查: 用真实 SQL 查询替代 pg_isready。pg_isready 在 postgres 初始化临时
+#      服务器阶段与崩溃恢复（in recovery mode）阶段均会误报成功，导致 app 抢先跑迁移而失败
+#      （schema_migrations 停在 dirty 状态）。psql 真实查询在 recovery 期间返回 57P03，
+#      可正确阻断 app 启动。
+#   3. app: 补 depends_on，与 (2) 配合保证启动顺序。
+# 升级提示：上游 docker-compose.yml 结构调整时，请重新核对本覆盖的兼容性。
+services:
+  postgres:
+    command: ["postgres", "-c", "listen_addresses=*", "-c", "shared_preload_libraries=pg_search"]
+    healthcheck:
+      test: ["CMD-SHELL", "psql -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\" -c 'SELECT 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+  app:
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      docreader:
+        condition: service_healthy
