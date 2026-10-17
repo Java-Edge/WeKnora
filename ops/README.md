@@ -127,7 +127,26 @@ docker compose logs -f docreader                 # 看解析服务日志
   ```
 - **关键认知**: Docker 容器内 localhost 指向容器自身而非宿主机，**Base URL 必须填 `http://host.docker.internal:1234/v1`** 才能访问宿主机上的 LM Studio / Ollama（compose 已内置 `extra_hosts: host.docker.internal:host-gateway`）。容器内验证: `docker compose exec app curl http://host.docker.internal:1234/v1/models`
 
-### #9 官方 README / 网页抓取被拦截
+### #9 电脑重启后 redis / app 崩溃循环
+- **现象**: 宿主机重启后 Docker 自动拉起容器，但 docker 面板显示 WeKnora-app、WeKnora-redis 反复重启（Restarting），UI 能开但功能不可用
+- **根因**:
+  1. redis: 非正常关机导致 AOF 增量文件 `appendonlydir/appendonly.aof.N.incr.aof` 末尾写入被截断（日志: `Bad file format reading the append only file ... use ./redis-check-aof --fix`），redis 拒绝加载，启动即退出；
+  2. app: redis 反复退出期间容器网络端点被摘除，app 连不上 redis（日志: `连接Redis失败: dial tcp: lookup redis on 127.0.0.11:53: no such host`），启动 panic，跟着 crash loop。
+- **修复**（顺序不能反，先修 redis 再管 app）:
+  ```bash
+  # 1. 从崩溃循环中的容器拷出 AOF 目录（docker cp 对停止/重启中的容器可用，exec 不行）
+  mkdir -p /tmp/aoffix && docker cp WeKnora-redis:/data/appendonlydir /tmp/aoffix/appendonlydir
+  # 2. 用官方工具修复（会截断到最后一个完整命令，只丢关机前半截写入）
+  docker run --rm -v /tmp/aoffix:/fix redis:7.0-alpine sh -c "echo y | redis-check-aof --fix /fix/appendonlydir/appendonly.aof.N.incr.aof"
+  # 3. 拷回容器并拉起
+  docker cp /tmp/aoffix/appendonlydir/appendonly.aof.N.incr.aof WeKnora-redis:/data/appendonlydir/
+  docker compose -f docker-compose.yml -f docker-compose.override.yml --env-file .env up -d redis app
+  ```
+- **注意**: redis 服务未声明持久化卷，AOF 在容器可写层——`down` 重建容器会丢 redis 数据（影响仅限 asynq 任务队列等瞬态数据，主数据在 postgres）。且容器重建后此修复手段（docker cp）失效，只能 down -v 重新来
+- **排查提示**: 看到 app 报 `lookup redis ... no such host`，是下游症状，根因在 redis 自身，别去改 app 配置
+- **预防**: 宿关机前先在面板停 WeKnora（优雅停机，compose stop 会 SIGTERM 让 redis 落盘）；重启后先进 Docker 面板看有没有容器处于 Restarting，别直接开始用
+
+### #10 官方 README / 网页抓取被拦截
 - **现象**: WebFetch 对 github.com 与 raw.githubusercontent.com 均失败
 - **修复**: 改用 `curl -sL <url> | tr -d '\r'` 落盘再读
 - **说明**: 仅影响信息收集方式，不影响部署本身，记录备查
